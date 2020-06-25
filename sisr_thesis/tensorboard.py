@@ -25,17 +25,22 @@ __all__=['LearnerTensorboardWriter', 'GANTensorboardWriter', 'ImageGenTensorboar
 
 class LearnerTensorboardWriter(LearnerCallback):
     "Broadly useful callback for Learners that writes to Tensorboard.  Writes model histograms, losses/metrics, and gradient stats."
-    def __init__(self, learn:Learner, base_dir:Path, name:str, loss_iters:int=25, hist_iters:int=500, stats_iters:int=100):
+    def __init__(self, learn:Learner, tbwriter:SummaryWriter, loss_iters:int=1, hist_iters:int=500, stats_iters:int=100):
         super().__init__(learn=learn)
-        self.base_dir,self.name,self.loss_iters,self.hist_iters,self.stats_iters  = base_dir,name,loss_iters,hist_iters,stats_iters
-        log_dir = base_dir/name
-        self.tbwriter = SummaryWriter(str(log_dir))
+        self.tbwriter,self.loss_iters,self.hist_iters,self.stats_iters  = tbwriter,loss_iters,hist_iters,stats_iters
         self.hist_writer = HistogramTBWriter()
         self.stats_writer = ModelStatsTBWriter()
         self.graph_writer = GraphTBWriter()
+        self.write_graph = False
         self.data = None
         self.metrics_root = '/metrics/'
         self._update_batches_if_needed()
+        self.prev_iterations = 0
+        self.prev_epochs = 0
+        
+    def reset(self):
+        self.prev_iterations = 0
+        self.prev_epochs = 0
 
     def _get_new_batch(self, ds_type:DatasetType)->Collection[Tensor]:
         "Retrieves new batch of DatasetType, and detaches it."
@@ -46,16 +51,19 @@ class LearnerTensorboardWriter(LearnerCallback):
         if self.learn.data.valid_dl is None: return # Running learning rate finder, so return
         update_batches = self.data is not self.learn.data
         if not update_batches: return
+        #print("_update_batches_if_needed")
         self.data = self.learn.data
         self.trn_batch = self._get_new_batch(ds_type=DatasetType.Train)
         self.val_batch = self._get_new_batch(ds_type=DatasetType.Valid)
 
     def _write_model_stats(self, iteration:int)->None:
         "Writes gradient statistics to Tensorboard."
+        #print("_write_model_stats")
         self.stats_writer.write(model=self.learn.model, iteration=iteration, tbwriter=self.tbwriter)
 
     def _write_training_loss(self, iteration:int, last_loss:Tensor)->None:
         "Writes training loss to Tensorboard."
+        #print("_write_training_loss")
         scalar_value = to_np(last_loss)
         tag = self.metrics_root + 'train_loss'
         self.tbwriter.add_scalar(tag=tag, scalar_value=scalar_value, global_step=iteration)
@@ -78,41 +86,73 @@ class LearnerTensorboardWriter(LearnerCallback):
             scalar_value = last_metrics[i]
             self._write_scalar(name=name, scalar_value=scalar_value, iteration=iteration)
 
-    def _write_embedding(self, iteration:int)->None:
-        "Writes embedding to Tensorboard."
-        for name, emb in self.learn.model.named_children():
-            if isinstance(emb, nn.Embedding):
-                self.tbwriter.add_embedding(list(emb.parameters())[0], global_step=iteration, tag=name)
-
     def on_train_begin(self, **kwargs: Any) -> None:
-        self.graph_writer.write(model=self.learn.model, tbwriter=self.tbwriter,
-                                input_to_model=next(iter(self.learn.data.dl(DatasetType.Single)))[0])
+        if self.write_graph:
+            self.graph_writer.write(model=self.learn.model, tbwriter=self.tbwriter,
+                                    input_to_model=next(iter(self.learn.data.dl(DatasetType.Single)))[0])
 
     def on_batch_end(self, last_loss:Tensor, iteration:int, train:bool, **kwargs)->None:
         "Callback function that writes batch end appropriate data to Tensorboard."
-        if iteration == 0 or not train: return
+        it = iteration + self.prev_iterations
+        #print(f"on_batch_end, loss:{last_loss}, train:{train}, it{iteration}/{it}")
+        if it == 0 or not train: return
         self._update_batches_if_needed()
-        if iteration % self.loss_iters == 0: self._write_training_loss(iteration=iteration, last_loss=last_loss)
-        if iteration % self.hist_iters == 0: self._write_weight_histograms(iteration=iteration)
+        if it % self.loss_iters == 0: 
+            #print("_write_training_loss")
+            self._write_training_loss(iteration=it, last_loss=last_loss)
+        if it % self.hist_iters == 0: 
+            #print("_write_weight_histograms")
+            self._write_weight_histograms(iteration=it)
 
     # Doing stuff here that requires gradient info, because they get zeroed out afterwards in training loop
     def on_backward_end(self, iteration:int, train:bool, **kwargs)->None:
         "Callback function that writes backward end appropriate data to Tensorboard."
         if iteration == 0 and not train: return
         self._update_batches_if_needed()
-        if iteration % self.stats_iters == 0: self._write_model_stats(iteration=iteration)
+        if iteration % self.stats_iters == 0: self._write_model_stats(iteration=iteration + self.prev_iterations)
 
     def on_epoch_end(self, last_metrics:MetricsList, iteration:int, **kwargs)->None:
         "Callback function that writes epoch end appropriate data to Tensorboard."
-        self._write_metrics(iteration=iteration, last_metrics=last_metrics)
-        self._write_embedding(iteration=iteration)
+        self._write_metrics(iteration=self.prev_epochs, last_metrics=last_metrics)
+        self.prev_epochs += 1
+        
+    def on_train_end(self, iteration:int, **kwargs)->None:
+        "Keep track of total numbers of iterations"
+        #print("on_train_end", iteration, self.prev_iterations)
+        self.prev_iterations += iteration 
+
+class ImageGenTensorboardWriter(LearnerTensorboardWriter):
+    "Callback for non-GAN image generating Learners that writes to Tensorboard.  Extends LearnerTensorboardWriter and adds output image writes."
+    def __init__(self, learn:Learner, tbwriter:SummaryWriter, loss_iters:int=1, hist_iters:int=500, stats_iters:int=100, 
+                 visual_iters:int=100):
+        super().__init__(learn=learn, tbwriter=tbwriter, loss_iters=loss_iters, hist_iters=hist_iters, 
+                         stats_iters=stats_iters)
+        self.visual_iters = visual_iters
+        self.img_gen_vis = ImageTBWriter()
+
+    def _write_images(self, epoch:int)->None:
+        #print(f'Writing images. Queue: {asyncTBWriter.queue.qsize()}')
+        "Writes model generated, original and real images to Tensorboard"
+        self.img_gen_vis.write(learn=self.learn, trn_batch=self.trn_batch, val_batch=self.val_batch, iteration=epoch, 
+                               tbwriter=self.tbwriter)
+
+    def on_batch_end(self, iteration:int, train:bool, **kwargs)->None:  
+        "Callback function that writes batch end appropriate data to Tensorboard."
+        super().on_batch_end(iteration=iteration, train=train, **kwargs)
+        
+    def on_epoch_end(self, last_metrics:MetricsList, iteration:int, **kwargs)->None:
+        super().on_epoch_end(last_metrics, iteration, **kwargs)
+        #print("on_epoch_end:ImageGen")
+        if (self.prev_epochs) % self.visual_iters == 0: 
+            self._write_images(epoch=self.prev_epochs)
+
 
 # TODO:  We're overriding almost everything here.  Seems like a good idea to question that ("is a" vs "has a")
 class GANTensorboardWriter(LearnerTensorboardWriter):
     "Callback for GANLearners that writes to Tensorboard.  Extends LearnerTensorboardWriter and adds output image writes."
-    def __init__(self, learn:GANLearner, base_dir:Path, name:str, loss_iters:int=25, hist_iters:int=500, 
+    def __init__(self, learn:GANLearner, tbwriter:SummaryWriter, loss_iters:int=25, hist_iters:int=500, 
                 stats_iters:int=100, visual_iters:int=100):
-        super().__init__(learn=learn, base_dir=base_dir, name=name, loss_iters=loss_iters, hist_iters=hist_iters, stats_iters=stats_iters)
+        super().__init__(learn=learn, tbwriter = tbwriter, loss_iters=loss_iters, hist_iters=hist_iters, stats_iters=stats_iters)
         self.visual_iters = visual_iters
         self.img_gen_vis = ImageTBWriter()
         self.gen_stats_updated = True
@@ -177,27 +217,7 @@ class GANTensorboardWriter(LearnerTensorboardWriter):
         if iteration % self.stats_iters == 0: self.gen_stats_updated, self.crit_stats_updated = False, False
         if not (self.gen_stats_updated and self.crit_stats_updated): self._write_model_stats(iteration=iteration)
 
-class ImageGenTensorboardWriter(LearnerTensorboardWriter):
-    "Callback for non-GAN image generating Learners that writes to Tensorboard.  Extends LearnerTensorboardWriter and adds output image writes."
-    def __init__(self, learn:Learner, base_dir:Path, name:str, loss_iters:int=25, hist_iters:int=500, stats_iters:int=100, 
-                 visual_iters:int=100):
-        super().__init__(learn=learn, base_dir=base_dir, name=name, loss_iters=loss_iters, hist_iters=hist_iters, 
-                         stats_iters=stats_iters)
-        self.visual_iters = visual_iters
-        self.img_gen_vis = ImageTBWriter()
-
-    def _write_images(self, iteration:int)->None:
-        print(f'Writing images. Queue: {asyncTBWriter.queue.qsize()}')
-        "Writes model generated, original and real images to Tensorboard"
-        self.img_gen_vis.write(learn=self.learn, trn_batch=self.trn_batch, val_batch=self.val_batch, iteration=iteration, 
-                               tbwriter=self.tbwriter)
-
-    def on_batch_end(self, iteration:int, train:bool, **kwargs)->None:  
-        "Callback function that writes batch end appropriate data to Tensorboard."
-        super().on_batch_end(iteration=iteration, train=train, **kwargs)
-        if iteration == 0 and not train: return
-        if iteration % self.visual_iters == 0: self._write_images(iteration=iteration)
-
+            
 class TBWriteRequest(ABC):
     "A request object for Tensorboard writes.  Useful for queuing up and executing asynchronous writes."
     def __init__(self, tbwriter: SummaryWriter, iteration:int):
@@ -369,7 +389,8 @@ class ModelStatsTBWriter():
     def write(self, model:nn.Module, iteration:int, tbwriter:SummaryWriter, name:str='model_stats')->None:
         "Writes model gradient statistics to Tensorboard."
         request = ModelStatsTBRequest(model=model, iteration=iteration, tbwriter=tbwriter, name=name)
-        asyncTBWriter.request_write(request)
+        request.write()
+        #asyncTBWriter.request_write(request)
 
 class ImageTBRequest(TBWriteRequest):
     "Request object for model image output writes to Tensorboard."
@@ -412,7 +433,8 @@ class ImageTBWriter():
     def _write_for_dstype(self, learn:Learner, batch:Tuple, iteration:int, tbwriter:SummaryWriter, ds_type:DatasetType)->None:
         "Writes batch images of specified DatasetType to Tensorboard."
         request = ImageTBRequest(learn=learn, batch=batch, iteration=iteration, tbwriter=tbwriter, ds_type=ds_type)
-        asyncTBWriter.request_write(request)
+        request.write()
+        #asyncTBWriter.request_write(request)
 
 class GraphTBRequest(TBWriteRequest):
     "Request object for model histogram writes to Tensorboard."
@@ -429,4 +451,5 @@ class GraphTBWriter():
     def write(self, model:nn.Module, tbwriter:SummaryWriter, input_to_model:torch.Tensor)->None:
         "Writes model graph to Tensorboard."
         request = GraphTBRequest(model=model, tbwriter=tbwriter, input_to_model=input_to_model)
-        asyncTBWriter.request_write(request)
+        request.write()
+        #asyncTBWriter.request_write(request)
