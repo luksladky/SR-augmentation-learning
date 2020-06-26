@@ -33,6 +33,7 @@ def custom_gan_critic(
 def critic_learner(
     data: ImageDataBunch,
     loss_critic=AdaptiveLoss(nn.BCEWithLogitsLoss()),
+    callback_fns=[ShowGraph],
     nf: int = 256,
 ) -> Learner:
     return Learner(
@@ -40,5 +41,6 @@ def critic_learner(
         custom_gan_critic(nf=nf),
         metrics=accuracy_thresh_expand,
         loss_func=loss_critic,
+        callback_fns = callback_fns,
         wd=1e-3,
     )
